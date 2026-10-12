@@ -9,10 +9,31 @@ const connectedUsers = new Map();
 
 
 // =========================================================
+// REFERENCIA AL SOCKET.IO PRINCIPAL DE MACHINE
+// =========================================================
+//
+// Permite que otros módulos del backend,
+// como profileAccess.routes.js, puedan emitir eventos
+// utilizando EL MISMO Socket.IO.
+//
+// NO crea una segunda conexión.
+// =========================================================
+
+let activeIo = null;
+
+
+// =========================================================
 // REGISTRAR SOCKET DE CHAT
 // =========================================================
 
 function registerChatSocket(io, socket) {
+
+  // =======================================================
+  // GUARDAR REFERENCIA DEL SOCKET.IO PRINCIPAL
+  // =======================================================
+
+  activeIo = io;
+
 
   console.log(
     `CHAT SOCKET CONNECTED: ${socket.id}`
@@ -826,12 +847,83 @@ function getUserSocketId(
 
   const connection =
     connectedUsers.get(
-      userId
+      String(userId)
     );
 
   return connection
     ? connection.socketId
     : null;
+
+}
+
+
+// =========================================================
+// EMITIR SOLICITUD DE ACCESO A PERFIL PRIVADO
+// =========================================================
+//
+// Esta función permite que profileAccess.routes.js
+// envíe una solicitud directamente al operador destino.
+//
+// Utiliza el MISMO Socket.IO principal de MACHINE.
+// =========================================================
+
+function emitProfileAccessRequest(
+  targetUserId,
+  payload
+) {
+
+  if (!activeIo) {
+
+    console.error(
+      "PROFILE ACCESS SOCKET: Socket.IO todavía no está disponible."
+    );
+
+    return false;
+
+  }
+
+
+  const connection =
+    connectedUsers.get(
+      String(targetUserId)
+    );
+
+
+  // =======================================================
+  // USUARIO DESTINO OFFLINE
+  // =======================================================
+
+  if (!connection) {
+
+    console.log(
+      `PROFILE ACCESS: usuario destino offline → ${targetUserId}`
+    );
+
+    return false;
+
+  }
+
+
+  // =======================================================
+  // ENVIAR SOLICITUD
+  // =======================================================
+
+  activeIo
+    .to(
+      connection.socketId
+    )
+    .emit(
+      "profile:access:request",
+      payload
+    );
+
+
+  console.log(
+    `PROFILE ACCESS REQUEST SENT: → ${targetUserId}`
+  );
+
+
+  return true;
 
 }
 
@@ -844,5 +936,6 @@ export {
   registerChatSocket,
   getConnectedUsers,
   getUserSocketId,
+  emitProfileAccessRequest,
 };
 
