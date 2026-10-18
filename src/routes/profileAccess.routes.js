@@ -457,617 +457,312 @@ const buildTargetProfilePayload = async (
 router.post(
   "/request/:targetUserId",
   async (req, res) => {
-
-    const client =
-      await pool.connect();
-
+    let client;
+    let transactionStarted = false;
 
     try {
+      const decoded = await authenticateSession(req, res);
 
-      const decoded =
-        await authenticateSession(
-          req,
-          res
-        );
+      if (!decoded) return;
 
+      const requesterUserId = String(decoded.userId).trim();
+      const normalizedTargetUserId = String(
+        req.params.targetUserId || ""
+      ).trim();
 
-      if (!decoded) {
-        return;
-      }
-
-
-      const requesterUserId =
-        String(
-          decoded.userId
-        ).trim();
-
-
-      const normalizedTargetUserId =
-        String(
-          req.params.targetUserId ||
-          ""
-        ).trim();
-
-
-      if (
-        !normalizedTargetUserId
-      ) {
-
+      if (!normalizedTargetUserId) {
         return res.status(400).json({
-
-          status:
-            "ERROR",
-
-          message:
-            "EL OPERADOR DESTINO NO ES VÁLIDO.",
-
+          status: "ERROR",
+          message: "EL OPERADOR DESTINO NO ES VÁLIDO.",
         });
-
       }
 
-
-      if (
-        requesterUserId ===
-        normalizedTargetUserId
-      ) {
-
+      if (requesterUserId === normalizedTargetUserId) {
         return res.status(400).json({
-
-          status:
-            "ERROR",
-
-          message:
-            "NO PUEDES SOLICITAR ACCESO A TU PROPIO PERFIL.",
-
+          status: "ERROR",
+          message: "NO PUEDES SOLICITAR ACCESO A TU PROPIO PERFIL.",
         });
-
       }
 
+      client = await pool.connect();
 
-      // =====================================================
-      // COMPROBAR TARGET
-      // =====================================================
+      // Serializar operaciones de solicitud para esta pareja
+      // de usuarios, incluso cuando todavía no existe una fila.
+      await client.query("BEGIN");
+      transactionStarted = true;
 
-      const targetResult =
-        await client.query(
-          `
-          SELECT
-            u.id,
-            u.status,
-            p.first_name,
-            p.last_name,
-            p.profile_visibility
+      await client.query(
+        `
+        SELECT pg_advisory_xact_lock(
+          hashtextextended($1::text || ':' || $2::text, 0)
+        )
+        `,
+        [requesterUserId, normalizedTargetUserId]
+      );
 
-          FROM public.users u
+      const targetResult = await client.query(
+        `
+        SELECT
+          u.id,
+          u.status,
+          p.first_name,
+          p.last_name,
+          p.profile_visibility
+        FROM public.users u
+        LEFT JOIN public.user_profiles p
+          ON p.user_id = u.id
+        WHERE u.id = $1
+        LIMIT 1
+        `,
+        [normalizedTargetUserId]
+      );
 
-          LEFT JOIN public.user_profiles p
-            ON p.user_id = u.id
-
-          WHERE u.id = $1
-
-          LIMIT 1
-          `,
-          [
-            normalizedTargetUserId,
-          ]
-        );
-
-
-      if (
-        targetResult.rows.length === 0
-      ) {
+      if (targetResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(404).json({
-
-          status:
-            "ERROR",
-
-          message:
-            "EL OPERADOR NO EXISTE.",
-
+          status: "ERROR",
+          message: "EL OPERADOR NO EXISTE.",
         });
-
       }
 
+      const target = targetResult.rows[0];
 
-      const target =
-        targetResult.rows[0];
-
-
-      if (
-        target.status !==
-        "active"
-      ) {
+      if (target.status !== "active") {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(403).json({
-
-          status:
-            "ERROR",
-
-          message:
-            "EL OPERADOR NO SE ENCUENTRA ACTIVO.",
-
+          status: "ERROR",
+          message: "EL OPERADOR NO SE ENCUENTRA ACTIVO.",
         });
-
       }
 
+      const profileVisibility = String(
+        target.profile_visibility || "PUBLIC"
+      ).trim().toUpperCase();
 
-      const profileVisibility =
-        String(
-          target.profile_visibility ||
-          "PUBLIC"
-        )
-          .trim()
-          .toUpperCase();
-
-
-      if (
-        profileVisibility !==
-        "PRIVATE"
-      ) {
+      if (profileVisibility !== "PRIVATE") {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(400).json({
-
-          status:
-            "ERROR",
-
-          message:
-            "ESTE PERFIL NO ES PRIVADO.",
-
+          status: "ERROR",
+          message: "ESTE PERFIL NO ES PRIVADO.",
         });
-
       }
 
-
-      // =====================================================
-      // BUSCAR ÚLTIMA SOLICITUD
-      // =====================================================
-
-      const existingResult =
-        await client.query(
-          `
-          SELECT
-            id,
-            requester_user_id,
-            target_user_id,
-            status,
-            created_at,
-            responded_at,
-            interpreted_at,
-
-            responsibility_accepted_at,
-            accessed_at,
-            access_started_at,
-            access_expires_at,
-            access_closed_at,
-            access_closed_reason
-
-          FROM public.profile_access_requests
-
-          WHERE requester_user_id = $1
-            AND target_user_id = $2
-
-          ORDER BY
-            created_at DESC
-
-          LIMIT 1
-          `,
-          [
-            requesterUserId,
-            normalizedTargetUserId,
-          ]
-        );
-
-
-      if (
-        existingResult.rows.length >
-        0
-      ) {
-
-        const existing =
-          existingResult.rows[0];
-
-
-        const existingStatus =
-          String(
-            existing.status || ""
-          )
-            .trim()
-            .toUpperCase();
-
-
-        // ===================================================
-        // PENDING
-        // ===================================================
-
-        if (
-          existingStatus ===
-          "PENDING"
-        ) {
-
-          const payload =
-            await buildProfileAccessPayload(
-              client,
-              existing
-            );
-
-
-          const notificationSent =
-            Boolean(
-              emitProfileAccessRequest(
-                normalizedTargetUserId,
-                {
-                  ...payload,
-                  eventType:
-                    "PROFILE_ACCESS_REQUEST",
-                }
-              )
-            );
-
-
-          return res.status(409).json({
-
-            status:
-              "PENDING",
-
-            message:
-              notificationSent
-                ? "YA EXISTE UNA SOLICITUD PENDIENTE. LA NOTIFICACIÓN FUE ENVIADA NUEVAMENTE."
-                : "YA EXISTE UNA SOLICITUD PENDIENTE. EL OPERADOR DESTINO NO ESTÁ CONECTADO.",
-
-            notificationSent,
-
-            request:
-              payload,
-
-          });
-
-        }
-
-
-        // ===================================================
-// APPROVED SIN ACEPTAR RESPONSABILIDAD
-// ===================================================
-//
-// APPROVED significa que el propietario YA autorizó
-// esta solicitud.
-//
-// Este endpoint es solamente para CREAR/REINTENTAR
-// una solicitud.
-//
-// Por lo tanto:
-//
-// - NO enviamos PROFILE_ACCESS_APPROVED al propietario.
-// - NO mostramos una autorización nueva.
-// - NO convertimos una solicitud anterior en una nueva.
-// - La autorización existente queda disponible para
-//   que el solicitante continúe con responsabilidad.
-//
-// ===================================================
-
-if (
-  existingStatus ===
-  "APPROVED"
-  &&
-  !existing.responsibility_accepted_at
-  &&
-  !existing.access_started_at
-) {
-
-  const payload =
-    await buildProfileAccessPayload(
-      client,
-      existing
-    );
-
-
-  return res.status(200).json({
-
-    status:
-      "APPROVED",
-
-    message:
-      "ESTA SOLICITUD YA FUE AUTORIZADA. DEBES ACEPTAR LA RESPONSABILIDAD ANTES DE ACCEDER AL PERFIL.",
-
-    notificationSent:
-      false,
-
-    request:
-      payload,
-
-  });
-
-}
-
-        // ===================================================
-        // ACCESO ACTIVO
-        // ===================================================
-
-        if (
-          existingStatus ===
-          "APPROVED"
-          &&
-          existing.access_started_at
-          &&
-          existing.access_expires_at
-          &&
-          !existing.access_closed_at
-        ) {
-
-          const expirationTime =
-            new Date(
-              existing.access_expires_at
-            ).getTime();
-
-
-          const now =
-            Date.now();
-
-
-          // -------------------------------------------------
-          // TODAVÍA ACTIVO
-          // -------------------------------------------------
-
-          if (
-            expirationTime >
-            now
-          ) {
-
-            return res.status(409).json({
-
-              status:
-                "ACTIVE",
-
-              message:
-                "YA EXISTE UN ACCESO ACTIVO A ESTE PERFIL.",
-
-              request: {
-
-                id:
-                  existing.id,
-
-                requesterUserId:
-                  existing.requester_user_id,
-
-                targetUserId:
-                  existing.target_user_id,
-
-                status:
-                  existing.status,
-
-                accessStartedAt:
-                  existing.access_started_at,
-
-                accessExpiresAt:
-                  existing.access_expires_at,
-
-              },
-
-            });
-
-          }
-
-
-          // -------------------------------------------------
-          // EXPIRADO
-          // -------------------------------------------------
-
-          await client.query(
-            `
-            UPDATE public.profile_access_requests
-
-            SET
-              access_closed_at =
-                COALESCE(
-                  access_closed_at,
-                  NOW()
-                ),
-
-              access_closed_reason =
-                COALESCE(
-                  access_closed_reason,
-                  'EXPIRED'
-                )
-
-            WHERE id = $1
-            `,
-            [
-              existing.id,
-            ]
+      const existingResult = await client.query(
+        `
+        SELECT
+          id,
+          requester_user_id,
+          target_user_id,
+          status,
+          created_at,
+          responded_at,
+          interpreted_at,
+          responsibility_accepted_at,
+          accessed_at,
+          access_started_at,
+          access_expires_at,
+          access_closed_at,
+          access_closed_reason
+        FROM public.profile_access_requests
+        WHERE requester_user_id = $1
+          AND target_user_id = $2
+        ORDER BY created_at DESC
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [requesterUserId, normalizedTargetUserId]
+      );
+
+      if (existingResult.rows.length > 0) {
+        const existing = existingResult.rows[0];
+
+        const existingStatus = String(
+          existing.status || ""
+        ).trim().toUpperCase();
+
+        if (existingStatus === "PENDING") {
+          const payload = await buildProfileAccessPayload(
+            client,
+            existing
           );
 
+          await client.query("COMMIT");
+          transactionStarted = false;
 
-          await registerAuditEvent(
+          const notificationSent = Boolean(
+            emitProfileAccessRequest(
+              normalizedTargetUserId,
+              {
+                ...payload,
+                eventType: "PROFILE_ACCESS_REQUEST",
+              }
+            )
+          );
+
+          return res.status(409).json({
+            status: "PENDING",
+            message: notificationSent
+              ? "YA EXISTE UNA SOLICITUD PENDIENTE. LA NOTIFICACIÓN FUE ENVIADA NUEVAMENTE."
+              : "YA EXISTE UNA SOLICITUD PENDIENTE. EL OPERADOR DESTINO NO ESTÁ CONECTADO.",
+            notificationSent,
+            request: payload,
+          });
+        }
+
+        if (
+          existingStatus === "APPROVED" &&
+          !existing.responsibility_accepted_at &&
+          !existing.access_started_at &&
+          !existing.access_closed_at
+        ) {
+          const payload = await buildProfileAccessPayload(
             client,
-            {
-              requestId:
-                existing.id,
+            existing
+          );
 
-              requesterUserId:
-                existing.requester_user_id,
+          await client.query("COMMIT");
+          transactionStarted = false;
 
-              targetUserId:
-                existing.target_user_id,
+          return res.status(200).json({
+            status: "APPROVED",
+            message:
+              "ESTA SOLICITUD YA FUE AUTORIZADA. DEBES ACEPTAR LA RESPONSABILIDAD ANTES DE ACCEDER AL PERFIL.",
+            notificationSent: false,
+            request: payload,
+          });
+        }
 
-              eventType:
-                "ACCESS_EXPIRED",
+        if (
+          existingStatus === "APPROVED" &&
+          existing.access_started_at &&
+          !existing.access_closed_at
+        ) {
+          const expirationResult = await client.query(
+            `
+            SELECT
+              access_expires_at IS NOT NULL
+              AND access_expires_at > NOW() AS is_active
+            FROM public.profile_access_requests
+            WHERE id = $1
+            `,
+            [existing.id]
+          );
 
+          if (expirationResult.rows[0]?.is_active) {
+            await client.query("COMMIT");
+            transactionStarted = false;
+
+            return res.status(409).json({
+              status: "ACTIVE",
+              message: "YA EXISTE UN ACCESO ACTIVO A ESTE PERFIL.",
+              request: {
+                id: existing.id,
+                requesterUserId: existing.requester_user_id,
+                targetUserId: existing.target_user_id,
+                status: existing.status,
+                accessStartedAt: existing.access_started_at,
+                accessExpiresAt: existing.access_expires_at,
+              },
+            });
+          }
+
+          const expiredResult = await client.query(
+            `
+            UPDATE public.profile_access_requests
+            SET
+              access_closed_at = NOW(),
+              access_closed_reason = 'EXPIRED'
+            WHERE id = $1
+              AND requester_user_id = $2
+              AND status = 'APPROVED'
+              AND access_started_at IS NOT NULL
+              AND access_closed_at IS NULL
+              AND (
+                access_expires_at IS NULL
+                OR access_expires_at <= NOW()
+              )
+            RETURNING
+              id,
+              requester_user_id,
+              target_user_id
+            `,
+            [existing.id, requesterUserId]
+          );
+
+          if (expiredResult.rows.length > 0) {
+            const expired = expiredResult.rows[0];
+
+            await registerAuditEvent(client, {
+              requestId: expired.id,
+              requesterUserId: expired.requester_user_id,
+              targetUserId: expired.target_user_id,
+              eventType: "ACCESS_EXPIRED",
               metadata: {
                 automatic: true,
               },
-
-            }
-          );
-
+            });
+          }
         }
-
       }
 
-
-      // =====================================================
-      // CREAR / REINICIAR NUEVO CICLO
-      // =====================================================
-      //
-      // Si existe una restricción UNIQUE por pareja de
-      // usuarios, reutilizamos el registro anterior.
-      //
-      // Esto NO elimina el historial:
-      // el historial queda almacenado en audit.
-      // =====================================================
-
-      const latestResult =
-        await client.query(
-          `
-          SELECT
-            id,
-            requester_user_id,
-            target_user_id,
-            status,
-            created_at,
-            responded_at,
-            interpreted_at,
-            responsibility_accepted_at,
-            accessed_at,
-            access_started_at,
-            access_expires_at,
-            access_closed_at,
-            access_closed_reason
-
-          FROM public.profile_access_requests
-
-          WHERE requester_user_id = $1
-            AND target_user_id = $2
-
-          ORDER BY
-            created_at DESC
-
-          LIMIT 1
-          `,
-          [
-            requesterUserId,
-            normalizedTargetUserId,
-          ]
-        );
-
+      const latestResult = await client.query(
+        `
+        SELECT
+          id,
+          requester_user_id,
+          target_user_id,
+          status,
+          created_at,
+          responded_at,
+          interpreted_at,
+          responsibility_accepted_at,
+          accessed_at,
+          access_started_at,
+          access_expires_at,
+          access_closed_at,
+          access_closed_reason
+        FROM public.profile_access_requests
+        WHERE requester_user_id = $1
+          AND target_user_id = $2
+        ORDER BY created_at DESC
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [requesterUserId, normalizedTargetUserId]
+      );
 
       let request;
 
+      if (latestResult.rows.length > 0) {
+        const latest = latestResult.rows[0];
 
-      if (
-        latestResult.rows.length >
-        0
-      ) {
+        const latestClosed = Boolean(latest.access_closed_at);
+        const latestStatus = String(
+          latest.status || ""
+        ).trim().toUpperCase();
 
-        const latest =
-          latestResult.rows[0];
-
-
-        const latestClosed =
-          Boolean(
-            latest.access_closed_at
-          );
-
-
-        const latestStatus =
-          String(
-            latest.status || ""
-          )
-            .trim()
-            .toUpperCase();
-
-
-        if (
-          latestClosed ||
-          latestStatus ===
-          "REJECTED"
-        ) {
-
-          const resetResult =
-            await client.query(
-              `
-              UPDATE public.profile_access_requests
-
-              SET
-                status = 'PENDING',
-                created_at = NOW(),
-                responded_at = NULL,
-                interpreted_at = NULL,
-
-                responsibility_accepted_at = NULL,
-                accessed_at = NULL,
-                access_started_at = NULL,
-                access_expires_at = NULL,
-                access_closed_at = NULL,
-                access_closed_reason = NULL
-
-              WHERE id = $1
-
-              RETURNING
-                id,
-                requester_user_id,
-                target_user_id,
-                status,
-                created_at,
-                responded_at,
-                interpreted_at,
-                responsibility_accepted_at,
-                accessed_at,
-                access_started_at,
-                access_expires_at,
-                access_closed_at,
-                access_closed_reason
-              `,
-              [
-                latest.id,
-              ]
-            );
-
-
-          request =
-            resetResult.rows[0];
-
-
-        } else {
-
-          // -----------------------------------------------
-          // Por seguridad, no crear otro acceso.
-          // -----------------------------------------------
-
-          return res.status(409).json({
-
-            status:
-              latestStatus,
-
-            message:
-              "YA EXISTE UNA SOLICITUD O AUTORIZACIÓN ACTIVA PARA ESTE PERFIL.",
-
-            request:
-              latest,
-
-          });
-
-        }
-
-
-      } else {
-
-        const insertResult =
-          await client.query(
+        if (latestClosed || latestStatus === "REJECTED") {
+          const resetResult = await client.query(
             `
-            INSERT INTO public.profile_access_requests (
-              requester_user_id,
-              target_user_id,
-              status,
-              created_at
-            )
-
-            VALUES (
-              $1,
-              $2,
-              'PENDING',
-              NOW()
-            )
-
+            UPDATE public.profile_access_requests
+            SET
+              status = 'PENDING',
+              created_at = NOW(),
+              responded_at = NULL,
+              interpreted_at = NULL,
+              responsibility_accepted_at = NULL,
+              accessed_at = NULL,
+              access_started_at = NULL,
+              access_expires_at = NULL,
+              access_closed_at = NULL,
+              access_closed_reason = NULL
+            WHERE id = $1
             RETURNING
               id,
               requester_user_id,
@@ -1083,123 +778,131 @@ if (
               access_closed_at,
               access_closed_reason
             `,
-            [
-              requesterUserId,
-              normalizedTargetUserId,
-            ]
+            [latest.id]
           );
 
+          request = resetResult.rows[0];
 
-        request =
-          insertResult.rows[0];
+          if (!request) {
+            throw new Error(
+              "NO SE PUDO REINICIAR LA SOLICITUD DE ACCESO."
+            );
+          }
+        } else {
+          await client.query("COMMIT");
+          transactionStarted = false;
 
+          return res.status(409).json({
+            status: latestStatus,
+            message:
+              "YA EXISTE UNA SOLICITUD O AUTORIZACIÓN ACTIVA PARA ESTE PERFIL.",
+            request: latest,
+          });
+        }
+      } else {
+        const insertResult = await client.query(
+          `
+          INSERT INTO public.profile_access_requests (
+            requester_user_id,
+            target_user_id,
+            status,
+            created_at
+          )
+          VALUES ($1, $2, 'PENDING', NOW())
+          RETURNING
+            id,
+            requester_user_id,
+            target_user_id,
+            status,
+            created_at,
+            responded_at,
+            interpreted_at,
+            responsibility_accepted_at,
+            accessed_at,
+            access_started_at,
+            access_expires_at,
+            access_closed_at,
+            access_closed_reason
+          `,
+          [requesterUserId, normalizedTargetUserId]
+        );
+
+        request = insertResult.rows[0];
       }
 
-
-      // =====================================================
-      // AUDITORÍA
-      // =====================================================
-
-      await registerAuditEvent(
-        client,
-        {
-          requestId:
-            request.id,
-
-          requesterUserId:
-            request.requester_user_id,
-
-          targetUserId:
-            request.target_user_id,
-
-          eventType:
-            "REQUEST_CREATED",
-
-          metadata: {
-            source:
-              "PRIVATE_PROFILE",
-          },
-
-        }
-      );
-
-
-      // =====================================================
-      // PAYLOAD
-      // =====================================================
-
-      const profileAccessPayload =
-        await buildProfileAccessPayload(
-          client,
-          request
+      if (!request) {
+        throw new Error(
+          "NO SE PUDO CREAR LA SOLICITUD DE ACCESO."
         );
+      }
 
-
-      // =====================================================
-      // SOCKET
-      // =====================================================
-
-      const notificationSent =
-        Boolean(
-          emitProfileAccessRequest(
-            normalizedTargetUserId,
-            {
-              ...profileAccessPayload,
-              eventType:
-                "PROFILE_ACCESS_REQUEST",
-            }
-          )
-        );
-
-
-      return res.status(201).json({
-
-        status:
-          "SUCCESS",
-
-        message:
-          notificationSent
-            ? "SOLICITUD DE ACCESO ENVIADA CORRECTAMENTE."
-            : "SOLICITUD REGISTRADA. EL OPERADOR DESTINO NO ESTÁ CONECTADO.",
-
-        notificationSent,
-
-        request:
-          profileAccessPayload,
-
+      await registerAuditEvent(client, {
+        requestId: request.id,
+        requesterUserId: request.requester_user_id,
+        targetUserId: request.target_user_id,
+        eventType: "REQUEST_CREATED",
+        metadata: {
+          source: "PRIVATE_PROFILE",
+        },
       });
 
+      const profileAccessPayload = await buildProfileAccessPayload(
+        client,
+        request
+      );
 
+      // Confirmar la solicitud y su auditoría antes de notificar.
+      await client.query("COMMIT");
+      transactionStarted = false;
+
+      const notificationSent = Boolean(
+        emitProfileAccessRequest(
+          normalizedTargetUserId,
+          {
+            ...profileAccessPayload,
+            eventType: "PROFILE_ACCESS_REQUEST",
+          }
+        )
+      );
+
+      return res.status(201).json({
+        status: "SUCCESS",
+        message: notificationSent
+          ? "SOLICITUD DE ACCESO ENVIADA CORRECTAMENTE."
+          : "SOLICITUD REGISTRADA. EL OPERADOR DESTINO NO ESTÁ CONECTADO.",
+        notificationSent,
+        request: profileAccessPayload,
+      });
     } catch (error) {
+      if (client && transactionStarted) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackError) {
+          console.error(
+            "PROFILE ACCESS REQUEST ROLLBACK ERROR:",
+            rollbackError
+          );
+        }
+      }
 
       console.error(
         "PROFILE ACCESS REQUEST ERROR:",
         error
       );
 
-
       return res.status(500).json({
-
-        status:
-          "ERROR",
-
-        message:
-          "NO FUE POSIBLE ENVIAR LA SOLICITUD DE ACCESO.",
-
-        notificationSent:
-          false,
-
+        status: "ERROR",
+        message: "NO FUE POSIBLE ENVIAR LA SOLICITUD DE ACCESO.",
+        notificationSent: false,
       });
-
-
     } finally {
-
-      client.release();
-
+      if (client) {
+        client.release();
+      }
     }
-
   }
 );
+
 
 
 // =========================================================
@@ -2804,821 +2507,620 @@ router.post(
 );
 
 
-// =========================================================
-// VERIFICAR / OBTENER PERFIL PRIVADO AUTORIZADO
-// =========================================================
-//
-// GET
-// /api/profile-access/:requestId/profile
-//
-// SOLAMENTE funciona mientras la sesión temporal esté activa.
-//
-// El backend vuelve a verificar el tiempo.
-// No confiamos únicamente en el contador de React.
-// =========================================================
+
+ // =========================================================
+ // VERIFICAR / OBTENER PERFIL PRIVADO AUTORIZADO
+ // =========================================================
+ //
+ // GET /api/profile-access/:requestId/profile
+ //
+ // El acceso solo funciona mientras la autorización temporal
+ // esté activa. El vencimiento se valida en PostgreSQL.
+ // =========================================================
 
 router.get(
   "/:requestId/profile",
   async (req, res) => {
-
-    const client =
-      await pool.connect();
-
+    let client;
+    let transactionStarted = false;
 
     try {
-
-      const decoded =
-        await authenticateSession(
-          req,
-          res
-        );
-
+      const decoded = await authenticateSession(req, res);
 
       if (!decoded) {
         return;
       }
 
+      const requesterUserId = decoded.userId;
+      const { requestId } = req.params;
 
-      const requesterUserId =
-        decoded.userId;
+      client = await pool.connect();
 
+      await client.query("BEGIN");
+      transactionStarted = true;
 
-      const {
-        requestId,
-      } = req.params;
+      // Bloquear la autorización para evitar que otra operación
+      // modifique su estado durante esta comprobación.
+      const accessResult = await client.query(
+        `
+        SELECT
+          id,
+          requester_user_id,
+          target_user_id,
+          status,
+          responsibility_accepted_at,
+          access_started_at,
+          access_expires_at,
+          access_closed_at
+        FROM public.profile_access_requests
+        WHERE id = $1
+          AND requester_user_id = $2
+        FOR UPDATE
+        `,
+        [requestId, requesterUserId]
+      );
 
-
-      const result =
-        await client.query(
-          `
-          SELECT
-            r.id,
-            r.requester_user_id,
-            r.target_user_id,
-            r.status,
-            r.responsibility_accepted_at,
-            r.accessed_at,
-            r.access_started_at,
-            r.access_expires_at,
-            r.access_closed_at,
-
-            u.id AS profile_user_id,
-            u.email,
-            u.employee_id,
-            u.role,
-            u.status AS user_status,
-
-            p.first_name,
-            p.last_name,
-            p.gender,
-            p.photo_url,
-            p.job_title
-
-          FROM public.profile_access_requests r
-
-          INNER JOIN public.users u
-            ON u.id =
-              r.target_user_id
-
-          LEFT JOIN public.user_profiles p
-            ON p.user_id =
-              r.target_user_id
-
-          WHERE r.id = $1
-            AND r.requester_user_id = $2
-
-          LIMIT 1
-          `,
-          [
-            requestId,
-            requesterUserId,
-          ]
-        );
-
-
-      if (
-        result.rows.length === 0
-      ) {
+      if (accessResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(404).json({
-
-          status:
-            "ERROR",
-
-          message:
-            "AUTORIZACIÓN DE PERFIL NO ENCONTRADA.",
-
+          status: "ERROR",
+          message: "AUTORIZACIÓN DE PERFIL NO ENCONTRADA.",
         });
-
       }
 
+      const access = accessResult.rows[0];
 
-      const row =
-        result.rows[0];
-
-
-      if (
-        row.status !==
-        "APPROVED"
-      ) {
+      if (access.status !== "APPROVED") {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(403).json({
-
-          status:
-            "FORBIDDEN",
-
-          message:
-            "EL PERFIL NO ESTÁ AUTORIZADO.",
-
+          status: "FORBIDDEN",
+          message: "EL PERFIL NO ESTÁ AUTORIZADO.",
         });
-
       }
 
-
-      if (
-        !row.access_started_at ||
-        !row.access_expires_at
-      ) {
+      if (!access.access_started_at) {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(403).json({
-
-          status:
-            "WAITING_RESPONSIBILITY",
-
+          status: "WAITING_RESPONSIBILITY",
           message:
             "DEBES ACEPTAR LA RESPONSABILIDAD ANTES DE VER EL PERFIL.",
-
         });
-
       }
 
-
-      if (
-        row.access_closed_at
-      ) {
+      if (access.access_closed_at) {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(403).json({
-
-          status:
-            "CLOSED",
-
-          message:
-            "EL ACCESO A ESTE PERFIL YA FINALIZÓ.",
-
+          status: "CLOSED",
+          message: "EL ACCESO A ESTE PERFIL YA FINALIZÓ.",
         });
-
       }
 
+      // PostgreSQL determina si el acceso sigue vigente.
+      const expirationResult = await client.query(
+        `
+        SELECT
+          access_expires_at IS NOT NULL
+          AND access_expires_at > NOW() AS is_active
+        FROM public.profile_access_requests
+        WHERE id = $1
+        `,
+        [requestId]
+      );
 
-      const expirationTime =
-        new Date(
-          row.access_expires_at
-        ).getTime();
-
-
-      if (
-        expirationTime <=
-        Date.now()
-      ) {
-
-        await client.query(
+      if (!expirationResult.rows[0]?.is_active) {
+        const expiredResult = await client.query(
           `
           UPDATE public.profile_access_requests
-
           SET
-            access_closed_at =
-              COALESCE(
-                access_closed_at,
-                NOW()
-              ),
-
-            access_closed_reason =
-              COALESCE(
-                access_closed_reason,
-                'EXPIRED'
-              )
-
+            access_closed_at = NOW(),
+            access_closed_reason = 'EXPIRED'
           WHERE id = $1
+            AND requester_user_id = $2
+            AND status = 'APPROVED'
+            AND access_started_at IS NOT NULL
+            AND access_closed_at IS NULL
+            AND (
+              access_expires_at IS NULL
+              OR access_expires_at <= NOW()
+            )
+          RETURNING
+            id,
+            requester_user_id,
+            target_user_id
           `,
-          [
-            requestId,
-          ]
+          [requestId, requesterUserId]
         );
 
+        if (expiredResult.rows.length > 0) {
+          const expired = expiredResult.rows[0];
 
-        await registerAuditEvent(
-          client,
-          {
-            requestId:
-              row.id,
-
-            requesterUserId:
-              row.requester_user_id,
-
-            targetUserId:
-              row.target_user_id,
-
-            eventType:
-              "ACCESS_EXPIRED",
-
+          await registerAuditEvent(client, {
+            requestId: expired.id,
+            requesterUserId: expired.requester_user_id,
+            targetUserId: expired.target_user_id,
+            eventType: "ACCESS_EXPIRED",
             metadata: {
-              automatic:
-                true,
+              automatic: true,
             },
+          });
+        }
 
-          }
-        );
-
+        await client.query("COMMIT");
+        transactionStarted = false;
 
         return res.status(403).json({
-
-          status:
-            "EXPIRED",
-
+          status: "EXPIRED",
           message:
             "EL TIEMPO DE ACCESO AL PERFIL HA FINALIZADO.",
-
         });
-
       }
 
+      // Obtener únicamente los datos permitidos del operador.
+      const profileResult = await client.query(
+        `
+        SELECT
+          u.id AS profile_user_id,
+          u.email,
+          u.employee_id,
+          u.role,
+          u.status AS user_status,
+          p.first_name,
+          p.last_name,
+          p.gender,
+          p.photo_url,
+          p.job_title
+        FROM public.users u
+        LEFT JOIN public.user_profiles p
+          ON p.user_id = u.id
+        WHERE u.id = $1
+        LIMIT 1
+        `,
+        [access.target_user_id]
+      );
 
-      // =====================================================
-      // DEVOLVER ÚNICAMENTE DATOS PROFESIONALES
-      // =====================================================
+      if (profileResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
+
+        return res.status(404).json({
+          status: "ERROR",
+          message: "NO SE ENCONTRÓ EL PERFIL DEL OPERADOR.",
+        });
+      }
+
+      const row = profileResult.rows[0];
+
+      await client.query("COMMIT");
+      transactionStarted = false;
 
       return res.status(200).json({
-
-        status:
-          "ACTIVE",
+        status: "ACTIVE",
 
         access: {
-
-          requestId:
-            row.id,
-
-          accessStartedAt:
-            row.access_started_at,
-
-          accessExpiresAt:
-            row.access_expires_at,
-
+          requestId: access.id,
+          accessStartedAt: access.access_started_at,
+          accessExpiresAt: access.access_expires_at,
         },
 
         profile: {
-
-          id:
-            row.profile_user_id,
-
-          email:
-            row.email,
-
-          employeeId:
-            row.employee_id,
-
-          role:
-            row.role,
-
-          status:
-            row.user_status,
-
-          firstName:
-            row.first_name,
-
-          lastName:
-            row.last_name,
-
-          gender:
-            row.gender,
-
-          photoUrl:
-            row.photo_url ||
-            "/operador.png",
-
-          jobTitle:
-            row.job_title,
-
+          id: row.profile_user_id,
+          email: row.email,
+          employeeId: row.employee_id,
+          role: row.role,
+          status: row.user_status,
+          firstName: row.first_name,
+          lastName: row.last_name,
+          gender: row.gender,
+          photoUrl: row.photo_url || "/operador.png",
+          jobTitle: row.job_title,
         },
-
       });
-
-
     } catch (error) {
+      if (client && transactionStarted) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackError) {
+          console.error(
+            "PROFILE ACCESS ROLLBACK ERROR:",
+            rollbackError
+          );
+        }
+      }
 
       console.error(
         "PROFILE ACCESS PRIVATE PROFILE ERROR:",
         error
       );
 
-
       return res.status(500).json({
-
-        status:
-          "ERROR",
-
-        message:
-          "NO FUE POSIBLE OBTENER EL PERFIL PRIVADO.",
-
+        status: "ERROR",
+        message: "NO FUE POSIBLE OBTENER EL PERFIL PRIVADO.",
       });
-
-
     } finally {
-
-      client.release();
-
+      if (client) {
+        client.release();
+      }
     }
-
   }
 );
 
 
-// =========================================================
-// CERRAR ACCESO MANUALMENTE
-// =========================================================
-//
-// POST
-// /api/profile-access/:requestId/close
-//
-// El solicitante puede cerrar el acceso antes de los
-// 3 minutos.
-//
-// Después de esto, para volver a ver el perfil debe
-// solicitar autorización nuevamente.
-// =========================================================
+
+/**
+ * =======================================================
+ * CERRAR ACCESO A PERFIL PRIVADO
+ * POST /api/profile-access/:requestId/close
+ * =======================================================
+ */
 
 router.post(
   "/:requestId/close",
   async (req, res) => {
-
-    const client =
-      await pool.connect();
-
+    let client;
 
     try {
-
-      const decoded =
-        await authenticateSession(
-          req,
-          res
-        );
-
+      const decoded = await authenticateSession(req, res);
 
       if (!decoded) {
         return;
       }
 
+      const requesterUserId = decoded.userId;
+      const { requestId } = req.params;
 
-      const requesterUserId =
-        decoded.userId;
+      client = await pool.connect();
 
+      await client.query("BEGIN");
 
-      const {
-        requestId,
-      } = req.params;
+      // Cerrar únicamente un acceso todavía vigente.
+      const result = await client.query(
+        `
+        UPDATE public.profile_access_requests
+        SET
+          access_closed_at = NOW(),
+          access_closed_reason = 'USER_CLOSED'
+        WHERE
+          id = $1
+          AND requester_user_id = $2
+          AND status = 'APPROVED'
+          AND responsibility_accepted_at IS NOT NULL
+          AND access_started_at IS NOT NULL
+          AND access_expires_at > NOW()
+          AND access_closed_at IS NULL
+        RETURNING
+          id,
+          requester_user_id,
+          target_user_id,
+          status,
+          access_started_at,
+          access_expires_at,
+          access_closed_at,
+          access_closed_reason
+        `,
+        [requestId, requesterUserId]
+      );
 
+      if (result.rows.length === 0) {
+        await client.query("ROLLBACK");
 
-      const result =
-        await client.query(
-          `
-          UPDATE public.profile_access_requests
-
-          SET
-            access_closed_at =
-              NOW(),
-
-            access_closed_reason =
-              'USER_CLOSED'
-
-          WHERE id = $1
-            AND requester_user_id = $2
-            AND access_started_at IS NOT NULL
-            AND access_closed_at IS NULL
-
-          RETURNING
-            id,
-            requester_user_id,
-            target_user_id,
-            status,
-            access_started_at,
-            access_expires_at,
-            access_closed_at,
-            access_closed_reason
-          `,
-          [
-            requestId,
-            requesterUserId,
-          ]
-        );
-
-
-      if (
-        result.rows.length === 0
-      ) {
-
-        return res.status(404).json({
-
-          status:
-            "ERROR",
-
+        return res.status(409).json({
+          status: "ERROR",
           message:
-            "NO EXISTE UN ACCESO ACTIVO PARA CERRAR.",
-
+            "EL ACCESO NO ESTÁ ACTIVO, YA FUE CERRADO O HA VENCIDO.",
         });
-
       }
 
+      const closed = result.rows[0];
 
-      const closed =
-        result.rows[0];
+      // Auditoría dentro de la misma transacción.
+      await registerAuditEvent(client, {
+        requestId: closed.id,
+        requesterUserId: closed.requester_user_id,
+        targetUserId: closed.target_user_id,
+        eventType: "ACCESS_CLOSED",
+        metadata: {
+          reason: "USER_CLOSED",
+        },
+      });
 
+      await client.query("COMMIT");
 
-      await registerAuditEvent(
-        client,
-        {
-          requestId:
-            closed.id,
-
-          requesterUserId:
-            closed.requester_user_id,
-
-          targetUserId:
-            closed.target_user_id,
-
-          eventType:
-            "ACCESS_CLOSED",
-
-          metadata: {
-            reason:
-              "USER_CLOSED",
-          },
-
-        }
-      );
-
-
-      emitProfileAccessRequest(
-        closed.target_user_id,
-        {
-
-          eventType:
-            "PROFILE_ACCESS_CLOSED",
-
-          requestId:
-            closed.id,
-
-          requesterUserId:
-            closed.requester_user_id,
-
-          targetUserId:
-            closed.target_user_id,
-
-          status:
-            closed.status,
-
-          accessClosedAt:
-            closed.access_closed_at,
-
-          accessClosedReason:
-            closed.access_closed_reason,
-
-          message:
-            "EL OPERADOR CERRÓ EL ACCESO A TU PERFIL.",
-
-        }
-      );
-
+      // Notificar al propietario solo después del COMMIT.
+      try {
+        emitProfileAccessRequest(
+          closed.target_user_id,
+          {
+            eventType: "PROFILE_ACCESS_CLOSED",
+            requestId: closed.id,
+            requesterUserId: closed.requester_user_id,
+            targetUserId: closed.target_user_id,
+            status: closed.status,
+            accessClosedAt: closed.access_closed_at,
+            accessClosedReason: closed.access_closed_reason,
+            message: "EL OPERADOR CERRÓ EL ACCESO A TU PERFIL.",
+          }
+        );
+      } catch (notificationError) {
+        console.error(
+          "PROFILE ACCESS CLOSE NOTIFICATION ERROR:",
+          notificationError
+        );
+      }
 
       return res.status(200).json({
-
-        status:
-          "CLOSED",
-
-        message:
-          "EL ACCESO AL PERFIL FUE CERRADO.",
-
+        status: "CLOSED",
+        message: "EL ACCESO AL PERFIL FUE CERRADO.",
         request: closed,
-
       });
-
-
     } catch (error) {
+      if (client) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackError) {
+          console.error(
+            "PROFILE ACCESS CLOSE ROLLBACK ERROR:",
+            rollbackError
+          );
+        }
+      }
 
-      console.error(
-        "PROFILE ACCESS CLOSE ERROR:",
-        error
-      );
-
+      console.error("PROFILE ACCESS CLOSE ERROR:", error);
 
       return res.status(500).json({
-
-        status:
-          "ERROR",
-
-        message:
-          "NO FUE POSIBLE CERRAR EL ACCESO AL PERFIL.",
-
+        status: "ERROR",
+        message: "NO FUE POSIBLE CERRAR EL ACCESO AL PERFIL.",
       });
-
-
     } finally {
-
-      client.release();
-
+      if (client) {
+        client.release();
+      }
     }
-
   }
 );
 
 
-// =========================================================
-// MARCAR PERFIL COMO INTERPRETADO
-// =========================================================
-//
-// Se conserva por compatibilidad con el flujo anterior.
-//
-// Ahora interpretado NO concede acceso.
-// =========================================================
+
+/**
+ * =======================================================
+ * MARCAR PERFIL COMO INTERPRETADO
+ * POST /api/profile-access/:requestId/interpreted
+ *
+ * Compatibilidad: esta acción NO concede acceso.
+ * =======================================================
+ */
 
 router.post(
   "/:requestId/interpreted",
   async (req, res) => {
-
-    const client =
-      await pool.connect();
-
+    let client;
 
     try {
-
-      const decoded =
-        await authenticateSession(
-          req,
-          res
-        );
-
+      const decoded = await authenticateSession(req, res);
 
       if (!decoded) {
         return;
       }
 
+      const requesterUserId = decoded.userId;
+      const { requestId } = req.params;
 
-      const requesterUserId =
-        decoded.userId;
+      client = await pool.connect();
 
+      await client.query("BEGIN");
 
-      const {
-        requestId,
-      } = req.params;
+      // Obtener y bloquear la solicitud para evitar
+      // modificaciones concurrentes sobre este registro.
+      const requestResult = await client.query(
+        `
+        SELECT
+          id,
+          requester_user_id,
+          target_user_id,
+          status,
+          interpreted_at,
+          access_started_at,
+          access_expires_at,
+          access_closed_at
+        FROM public.profile_access_requests
+        WHERE
+          id = $1
+          AND requester_user_id = $2
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [requestId, requesterUserId]
+      );
 
-
-      const requestResult =
-        await client.query(
-          `
-          SELECT
-            id,
-            requester_user_id,
-            target_user_id,
-            status,
-            interpreted_at,
-            access_started_at,
-            access_expires_at,
-            access_closed_at
-
-          FROM public.profile_access_requests
-
-          WHERE id = $1
-            AND requester_user_id = $2
-
-          LIMIT 1
-          `,
-          [
-            requestId,
-            requesterUserId,
-          ]
-        );
-
-
-      if (
-        requestResult.rows.length === 0
-      ) {
+      if (requestResult.rows.length === 0) {
+        await client.query("ROLLBACK");
 
         return res.status(404).json({
-
-          status:
-            "ERROR",
-
-          message:
-            "AUTORIZACIÓN DE PERFIL NO ENCONTRADA.",
-
+          status: "ERROR",
+          message: "AUTORIZACIÓN DE PERFIL NO ENCONTRADA.",
         });
-
       }
 
+      const request = requestResult.rows[0];
 
-      const request =
-        requestResult.rows[0];
-
-
-      if (
-        request.status !==
-        "APPROVED"
-      ) {
+      if (request.status !== "APPROVED") {
+        await client.query("ROLLBACK");
 
         return res.status(403).json({
-
-          status:
-            "ERROR",
-
-          message:
-            "EL PERFIL TODAVÍA NO ESTÁ AUTORIZADO.",
-
+          status: "ERROR",
+          message: "EL PERFIL TODAVÍA NO ESTÁ AUTORIZADO.",
         });
-
       }
 
-
-      if (
-        !request.access_started_at
-      ) {
+      if (!request.access_started_at) {
+        await client.query("ROLLBACK");
 
         return res.status(403).json({
-
-          status:
-            "WAITING_RESPONSIBILITY",
-
+          status: "WAITING_RESPONSIBILITY",
           message:
             "DEBES ACEPTAR LA RESPONSABILIDAD ANTES DE ACCEDER AL PERFIL.",
-
         });
-
       }
 
-
-      if (
-        request.access_closed_at
-      ) {
+      if (request.access_closed_at) {
+        await client.query("ROLLBACK");
 
         return res.status(403).json({
-
-          status:
-            "CLOSED",
-
-          message:
-            "EL ACCESO AL PERFIL YA FINALIZÓ.",
-
+          status: "CLOSED",
+          message: "EL ACCESO AL PERFIL YA FINALIZÓ.",
         });
-
       }
 
+      // El vencimiento se valida con el reloj de PostgreSQL.
+      const expirationResult = await client.query(
+        `
+        SELECT
+          access_expires_at > NOW() AS is_active
+        FROM public.profile_access_requests
+        WHERE id = $1
+        `,
+        [requestId]
+      );
 
       if (
-        request.interpreted_at
+        !request.access_expires_at ||
+        !expirationResult.rows[0]?.is_active
       ) {
-
-        return res.status(200).json({
-
-          status:
-            "ALREADY_INTERPRETED",
-
-          message:
-            "EL PERFIL YA FUE MARCADO COMO INTERPRETADO.",
-
-          interpretedAt:
-            request.interpreted_at,
-
-        });
-
-      }
-
-
-      const updateResult =
-        await client.query(
+        // Marcar el vencimiento solamente si aún no se cerró.
+        const expiredResult = await client.query(
           `
           UPDATE public.profile_access_requests
-
           SET
-            interpreted_at =
-              NOW()
-
-          WHERE id = $1
-            AND requester_user_id = $2
-            AND status = 'APPROVED'
-            AND access_started_at IS NOT NULL
+            access_closed_at = NOW(),
+            access_closed_reason = 'EXPIRED'
+          WHERE
+            id = $1
             AND access_closed_at IS NULL
-            AND interpreted_at IS NULL
-
-          RETURNING
-            id,
-            requester_user_id,
-            target_user_id,
-            status,
-            interpreted_at
+            AND access_expires_at <= NOW()
+          RETURNING id
           `,
-          [
-            requestId,
-            requesterUserId,
-          ]
+          [requestId]
         );
 
+        if (expiredResult.rows.length > 0) {
+          await registerAuditEvent(client, {
+            requestId: request.id,
+            requesterUserId: request.requester_user_id,
+            targetUserId: request.target_user_id,
+            eventType: "ACCESS_EXPIRED",
+            metadata: {
+              automatic: true,
+            },
+          });
+        }
 
-      if (
-        updateResult.rows.length === 0
-      ) {
+        await client.query("COMMIT");
 
-        return res.status(409).json({
-
-          status:
-            "ERROR",
-
-          message:
-            "NO FUE POSIBLE MARCAR EL PERFIL COMO INTERPRETADO.",
-
+        return res.status(403).json({
+          status: "EXPIRED",
+          message: "EL TIEMPO DE ACCESO AL PERFIL HA VENCIDO.",
         });
-
       }
 
+      if (request.interpreted_at) {
+        await client.query("COMMIT");
 
-      const interpreted =
-        updateResult.rows[0];
+        return res.status(200).json({
+          status: "ALREADY_INTERPRETED",
+          message: "EL PERFIL YA FUE MARCADO COMO INTERPRETADO.",
+          interpretedAt: request.interpreted_at,
+        });
+      }
 
-
-      await registerAuditEvent(
-        client,
-        {
-          requestId:
-            interpreted.id,
-
-          requesterUserId:
-            interpreted.requester_user_id,
-
-          targetUserId:
-            interpreted.target_user_id,
-
-          eventType:
-            "PROFILE_INTERPRETED",
-
-          metadata: {},
-
-        }
+      const updateResult = await client.query(
+        `
+        UPDATE public.profile_access_requests
+        SET interpreted_at = NOW()
+        WHERE
+          id = $1
+          AND requester_user_id = $2
+          AND status = 'APPROVED'
+          AND access_started_at IS NOT NULL
+          AND access_expires_at > NOW()
+          AND access_closed_at IS NULL
+          AND interpreted_at IS NULL
+        RETURNING
+          id,
+          requester_user_id,
+          target_user_id,
+          status,
+          interpreted_at
+        `,
+        [requestId, requesterUserId]
       );
 
+      if (updateResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+
+        return res.status(409).json({
+          status: "ERROR",
+          message:
+            "NO FUE POSIBLE MARCAR EL PERFIL COMO INTERPRETADO.",
+        });
+      }
+
+      const interpreted = updateResult.rows[0];
+
+      await registerAuditEvent(client, {
+        requestId: interpreted.id,
+        requesterUserId: interpreted.requester_user_id,
+        targetUserId: interpreted.target_user_id,
+        eventType: "PROFILE_INTERPRETED",
+        metadata: {},
+      });
+
+      await client.query("COMMIT");
 
       return res.status(200).json({
-
-        status:
-          "SUCCESS",
-
-        message:
-          "PERFIL MARCADO COMO INTERPRETADO.",
-
+        status: "SUCCESS",
+        message: "PERFIL MARCADO COMO INTERPRETADO.",
         request: {
-
-          id:
-            interpreted.id,
-
-          requesterUserId:
-            interpreted.requester_user_id,
-
-          targetUserId:
-            interpreted.target_user_id,
-
-          status:
-            interpreted.status,
-
-          interpretedAt:
-            interpreted.interpreted_at,
-
+          id: interpreted.id,
+          requesterUserId: interpreted.requester_user_id,
+          targetUserId: interpreted.target_user_id,
+          status: interpreted.status,
+          interpretedAt: interpreted.interpreted_at,
         },
-
       });
-
-
     } catch (error) {
+      if (client) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackError) {
+          console.error(
+            "PROFILE INTERPRETED ROLLBACK ERROR:",
+            rollbackError
+          );
+        }
+      }
 
-      console.error(
-        "PROFILE ACCESS INTERPRETED ERROR:",
-        error
-      );
-
+      console.error("PROFILE ACCESS INTERPRETED ERROR:", error);
 
       return res.status(500).json({
-
-        status:
-          "ERROR",
-
+        status: "ERROR",
         message:
           "NO FUE POSIBLE MARCAR EL PERFIL COMO INTERPRETADO.",
-
       });
-
-
     } finally {
-
-      client.release();
-
+      if (client) {
+        client.release();
+      }
     }
-
   }
 );
+
 
 
 // =========================================================
