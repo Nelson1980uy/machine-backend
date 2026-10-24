@@ -1,3 +1,4 @@
+
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -17,11 +18,10 @@ import operatorActivityRoutes from "./routes/operatorActivity.routes.js";
 import professionalVotesRoutes from "./routes/professionalVotes.routes.js";
 import operatorLocationsRoutes from "./routes/operatorLocations.routes.js";
 import operatorNearbyRoutes from "./routes/operatorNearby.routes.js";
-
-import {
-  registerChatSocket,
-} from "./socket/chat.socket.js";
-
+import sparePartsGovernanceRoutes from "./routes/sparePartsGovernance.routes.js";
+import sparePartsRoutes from "./routes/spareParts.routes.js";
+import { registerChatSocket } from "./socket/chat.socket.js";
+import mailRoutes from "./routes/mail.routes.js";
 
 // =========================================================
 // VARIABLES DE ENTORNO
@@ -29,53 +29,36 @@ import {
 
 dotenv.config();
 
-
 // =========================================================
 // RUTAS DEL SISTEMA DE ARCHIVOS
 // =========================================================
 
-const __filename =
-  fileURLToPath(import.meta.url);
-
-const __dirname =
-  path.dirname(__filename);
-
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // =========================================================
 // APLICACIÓN EXPRESS
 // =========================================================
 
-const app =
-  express();
-
-const PORT =
-  process.env.PORT ||
-  8080;
-
+const app = express();
+const PORT = process.env.PORT || 8080;
 
 // =========================================================
 // SERVIDOR HTTP
 // =========================================================
 
-const httpServer =
-  createServer(app);
-
+const httpServer = createServer(app);
 
 // =========================================================
 // SOCKET.IO
 // =========================================================
 
-const io =
-  new Server(
-    httpServer,
-    {
-      cors: {
-        origin: true,
-        credentials: true,
-      },
-    }
-  );
-
+const io = new Server(httpServer, {
+  cors: {
+    origin: true,
+    credentials: true,
+  },
+});
 
 // =========================================================
 // MIDDLEWARE CORS
@@ -88,63 +71,48 @@ app.use(
   })
 );
 
-
 // =========================================================
 // JSON
 // =========================================================
 
-app.use(
-  express.json()
-);
-
+app.use(express.json());
 
 // =========================================================
 // ARCHIVOS MULTIMEDIA
 // =========================================================
 //
-// Los archivos guardados por MACHINE estarán en:
+// Los archivos de MACHINE se guardan en:
 //
-// machine-backend/uploads/chat
+// machine-backend/uploads
 //
 // Se sirven mediante:
 //
-// /uploads/chat/nombre-del-archivo
+// /uploads/nombre-del-archivo
 //
 // =========================================================
 
-const uploadsPath =
-  path.join(
-    __dirname,
-    "..",
-    "uploads"
-  );
-
-app.use(
-  "/uploads",
-  express.static(
-    uploadsPath
-  )
+const uploadsPath = path.join(
+  __dirname,
+  "..",
+  "uploads"
 );
 
-app.use(
-  "/api/operator-activity",
-  operatorActivityRoutes
-);
-
+app.use("/uploads", express.static(uploadsPath));
 
 // =========================================================
 // API ROUTES
 // =========================================================
 
 app.use(
-  "/api/auth",
-  authRoutes
+  "/api/operator-activity",
+  operatorActivityRoutes
 );
 
-app.use(
-  "/api/chat",
-  chatRoutes
-);
+app.use("/api/auth", authRoutes);
+
+app.use("/api/chat", chatRoutes);
+
+app.use("/api/mail", mailRoutes);
 
 app.use(
   "/api/profile-access",
@@ -171,174 +139,91 @@ app.use(
   profileVisitsRoutes
 );
 
+app.use("/api/public", publicRoutes);
+
+// =========================================================
+// REPOSITORIO DE REPUESTOS
+// =========================================================
+
 app.use(
-  "/api/public",
-  publicRoutes
+  "/api/spare-parts/governance",
+  sparePartsGovernanceRoutes
+);
+
+app.use(
+  "/api/spare-parts",
+  sparePartsRoutes
 );
 
 // =========================================================
 // SYSTEM STATUS
 // =========================================================
 
-app.get(
-  "/",
-  (req, res) => {
-
-    res.json({
-      system:
-        "MACHINE",
-
-      status:
-        "ONLINE",
-
-      service:
-        "INDUSTRIAL CONTROL API",
-
-      version:
-        "1.0.0",
-    });
-
-  }
-);
-
+app.get("/", (req, res) => {
+  res.status(200).json({
+    system: "MACHINE",
+    status: "ONLINE",
+    service: "INDUSTRIAL CONTROL API",
+    version: "1.0.0",
+  });
+});
 
 // =========================================================
 // DATABASE HEALTH CHECK
 // =========================================================
 
-app.get(
-  "/api/health",
-  async (req, res) => {
+app.get("/api/health", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT NOW() AS server_time"
+    );
 
-    try {
+    return res.status(200).json({
+      status: "OK",
+      database: "CONNECTED",
+      serverTime: result.rows[0].server_time,
+    });
+  } catch (error) {
+    console.error(
+      "DATABASE ERROR:",
+      error.message
+    );
 
-      const result =
-        await pool.query(
-          "SELECT NOW() AS server_time"
-        );
-
-
-      return res.status(200).json({
-
-        status:
-          "OK",
-
-        database:
-          "CONNECTED",
-
-        serverTime:
-          result.rows[0]
-            .server_time,
-
-      });
-
-    } catch (error) {
-
-      console.error(
-        "DATABASE ERROR:",
-        error
-      );
-
-
-      return res.status(500).json({
-
-        status:
-          "ERROR",
-
-        database:
-          "DISCONNECTED",
-
-      });
-
-    }
-
+    return res.status(500).json({
+      status: "ERROR",
+      database: "DISCONNECTED",
+    });
   }
-);
-
+});
 
 // =========================================================
 // SOCKET.IO CONNECTION
 // =========================================================
 //
-// Toda conexión Socket.IO de MACHINE pasa por:
+// MACHINE utiliza una sola instancia de Socket.IO.
 //
-// registerChatSocket(io, socket)
-//
-// Allí se manejan actualmente:
-// - presencia
-// - chat privado
-// - mensajes
-// - mensajes leídos
-// - notificaciones
-//
-// También utilizaremos esta misma conexión para:
-// - solicitudes de acceso a perfiles privados
-//
-// NO se crea un segundo Socket.IO.
-//
+// registerChatSocket administra la conexión existente
+// para presencia, chat privado, mensajes y notificaciones.
 // =========================================================
 
-io.on(
-  "connection",
-  (socket) => {
-
-    registerChatSocket(
-      io,
-      socket
-    );
-
-  }
-);
-
+io.on("connection", (socket) => {
+  registerChatSocket(io, socket);
+});
 
 // =========================================================
 // START SERVER
 // =========================================================
 
-httpServer.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-
-    console.log("");
-
-    console.log(
-      "========================================"
-    );
-
-    console.log(
-      "        MACHINE BACKEND"
-    );
-
-    console.log(
-      "========================================"
-    );
-
-    console.log(
-      `SERVER: http://localhost:${PORT}`
-    );
-
-    console.log(
-      "STATUS: ONLINE"
-    );
-
-    console.log(
-      "SOCKET.IO: ENABLED"
-    );
-
-    console.log(
-      "DATABASE: READY"
-    );
-
-    console.log(
-      "UPLOADS: ENABLED"
-    );
-
-    console.log(
-      "========================================"
-    );
-
-    console.log("");
-
-  }
-);
+httpServer.listen(PORT, "0.0.0.0", () => {
+  console.log("");
+  console.log("========================================");
+  console.log("        MACHINE BACKEND");
+  console.log("========================================");
+  console.log(`SERVER: http://localhost:${PORT}`);
+  console.log("STATUS: ONLINE");
+  console.log("SOCKET.IO: ENABLED");
+  console.log("DATABASE: READY");
+  console.log("UPLOADS: ENABLED");
+  console.log("========================================");
+  console.log("");
+});

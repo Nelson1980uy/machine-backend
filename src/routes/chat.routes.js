@@ -5,6 +5,7 @@ import crypto from "crypto";
 
 import pool from "../config/database.js";
 import supabase from "../config/supabase.js";
+import { getConnectedUsers } from "../socket/chat.socket.js";
 
 const router = express.Router();
 
@@ -1542,173 +1543,148 @@ router.get(
             ) ASC
         `);
 
-      const operators =
-        result.rows.map(
-          (operator) => ({
 
-            id:
-              operator.id,
+      // =================================================
+      // PRESENCIA REAL DE OPERADORES MEDIANTE SOCKET.IO
+      // =================================================
 
-            email:
-              operator.email,
+      const connectedUserIds = new Set(
+        getConnectedUsers().map(
+          (connection) => String(connection.userId)
+        )
+      );
 
-            employeeId:
-              operator.employee_id,
+      // =================================================
+      // CONSTRUIR LISTA DE OPERADORES
+      // =================================================
 
-            role:
-              operator.role,
+      const operators = result.rows.map((operator) => ({
+        id:
+          operator.id,
 
-            status:
-              operator.status,
+        email:
+          operator.email,
 
-            lastLogin:
-              operator.last_login,
+        employeeId:
+          operator.employee_id,
 
-            firstName:
-              operator.first_name ||
-              "Operador",
-
-            lastName:
-              operator.last_name ||
-              "Local",
-
-            gender:
-              operator.gender ||
-              null,
-
-            photoUrl:
-              operator.photo_url ||
-              null,
-
-            photo:
-              operator.photo_url ||
-              null,
-
-            // =================================================
-            // DATOS PROFESIONALES
-            // =================================================
-
-            age:
-              operator.age ??
-              null,
-
-            jobTitle:
-              operator.job_title ||
-              "",
-
-            plant:
-              operator.plant ||
-              "",
-
-            plantNumber:
-              operator.plant_number ||
-              "",
-
-            sector:
-              operator.sector ||
-              "",
-
-            productionLine:
-              operator.production_line ||
-              "",
-
-            assignedMachine:
-              operator.assigned_machine ||
-              "",
-
-            shift:
-              operator.shift ||
-              "",
-
-            specialty:
-              operator.specialty ||
-              "",
-
-            hireDate:
-              operator.hire_date ||
-              null,
-
-            bio:
-              operator.bio ||
-              "",
-
-            // =================================================
-            // UBICACIÓN PÚBLICA / NO SENSIBLE
-            // =================================================
-
-            country:
-              operator.country ||
-              "",
-
-            department:
-              operator.department ||
-              "",
-
-            locality:
-              operator.locality ||
-              "",
-
-            // =================================================
-            // PRIVACIDAD DE UBICACIÓN
-            // =================================================
-
-            locationVisibility:
-              operator.location_visibility ||
-              "PRIVATE",
-
-            // =================================================
-            // PRIVACIDAD DEL PERFIL
-            // =================================================
-
-            profileVisibility:
-              String(
-                operator.profile_visibility ||
-                "PUBLIC"
-              ).toUpperCase() === "PRIVATE"
-                ? "PRIVATE"
-                : "PUBLIC",
-
-            // =================================================
-            // PRESENCIA
-            // =================================================
-            //
-            // La presencia real se manejará mediante Socket.IO.
-            //
-
-            isOnline:
-              false,
-
-          })
-        );
-
-      return res.json({
+        role:
+          operator.role,
 
         status:
-          "OK",
+          operator.status,
 
+        lastLogin:
+          operator.last_login,
+
+        firstName:
+          operator.first_name || "Operador",
+
+        lastName:
+          operator.last_name || "Local",
+
+        gender:
+          operator.gender || null,
+
+        photoUrl:
+          operator.photo_url || null,
+
+        photo:
+          operator.photo_url || null,
+
+        // =================================================
+        // DATOS PROFESIONALES
+        // =================================================
+
+        age:
+          operator.age ?? null,
+
+        jobTitle:
+          operator.job_title || "",
+
+        plant:
+          operator.plant || "",
+
+        plantNumber:
+          operator.plant_number || "",
+
+        sector:
+          operator.sector || "",
+
+        productionLine:
+          operator.production_line || "",
+
+        assignedMachine:
+          operator.assigned_machine || "",
+
+        shift:
+          operator.shift || "",
+
+        specialty:
+          operator.specialty || "",
+
+        hireDate:
+          operator.hire_date || null,
+
+        bio:
+          operator.bio || "",
+
+        // =================================================
+        // UBICACIÓN PÚBLICA / NO SENSIBLE
+        // =================================================
+
+        country:
+          operator.country || "",
+
+        department:
+          operator.department || "",
+
+        locality:
+          operator.locality || "",
+
+        // =================================================
+        // PRIVACIDAD DE UBICACIÓN
+        // =================================================
+
+        locationVisibility:
+          operator.location_visibility || "PRIVATE",
+
+        // =================================================
+        // PRIVACIDAD DEL PERFIL
+        // =================================================
+
+        profileVisibility:
+          String(
+            operator.profile_visibility || "PUBLIC"
+          ).toUpperCase() === "PRIVATE"
+            ? "PRIVATE"
+            : "PUBLIC",
+
+        // =================================================
+        // ESTADO REAL DE CONEXIÓN
+        // =================================================
+
+        isOnline: connectedUserIds.has(
+          String(operator.id)
+        ),
+      }));
+
+      return res.json({
+        status: "OK",
         operators,
-
       });
 
     } catch (error) {
-
       console.error(
         "CHAT GET OPERATORS ERROR:",
         error
       );
 
       return res.status(500).json({
-
-        status:
-          "ERROR",
-
-        message:
-          "No fue posible obtener los operadores.",
-
+        status: "ERROR",
+        message: "No fue posible obtener los operadores.",
       });
-
     }
-
   }
 );
 
