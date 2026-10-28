@@ -188,7 +188,8 @@ function respondError(res, error) {
   });
 }
 
-// ======================================================
+
+ // ======================================================
 // CATÁLOGO: operadores autenticados pueden consultar.
 // GET /api/spare-parts/catalog
 // ======================================================
@@ -216,25 +217,51 @@ router.get("/catalog", async (req, res) => {
     );
 
     const result = await pool.query(
-      `SELECT *
-       FROM public.spare_part_catalog
-       WHERE (
-         $1 = ''
-         OR internal_code ILIKE '%' || $1 || '%'
-         OR name ILIKE '%' || $1 || '%'
-         OR description ILIKE '%' || $1 || '%'
-         OR COALESCE(manufacturer, '') ILIKE '%' || $1 || '%'
-         OR COALESCE(manufacturer_reference, '') ILIKE '%' || $1 || '%'
-       )
-       AND (
-         $2 = ''
-         OR $2 = ANY(compatible_machines)
-       )
-       AND (
-         $3 = ''
-         OR category = $3
-       )
-       ORDER BY name ASC, internal_code ASC
+      `SELECT
+         p.*,
+         COALESCE(stock.total_on_hand, 0) AS total_on_hand,
+         COALESCE(stock.total_reserved, 0) AS total_reserved,
+         COALESCE(stock.total_available, 0) AS total_available,
+         COALESCE(stock.total_minimum_stock, 0) AS total_minimum_stock,
+         CASE
+           WHEN COALESCE(stock.total_available, 0) <= 0
+             THEN 'OUT_OF_STOCK'
+           WHEN COALESCE(stock.total_available, 0)
+                <= COALESCE(stock.total_minimum_stock, 0)
+             THEN 'LOW_STOCK'
+           ELSE 'IN_STOCK'
+         END AS stock_status
+       FROM public.spare_parts p
+       LEFT JOIN (
+         SELECT
+           part_id,
+           SUM(quantity_on_hand)::integer AS total_on_hand,
+           SUM(quantity_reserved)::integer AS total_reserved,
+           SUM(
+             quantity_on_hand - quantity_reserved
+           )::integer AS total_available,
+           SUM(minimum_stock)::integer AS total_minimum_stock
+         FROM public.spare_part_stock
+         GROUP BY part_id
+       ) stock ON stock.part_id = p.id
+       WHERE p.is_active = TRUE
+         AND (
+           $1 = ''
+           OR p.internal_code ILIKE '%' || $1 || '%'
+           OR p.name ILIKE '%' || $1 || '%'
+           OR p.description ILIKE '%' || $1 || '%'
+           OR COALESCE(p.manufacturer, '') ILIKE '%' || $1 || '%'
+           OR COALESCE(p.manufacturer_reference, '') ILIKE '%' || $1 || '%'
+         )
+         AND (
+           $2 = ''
+           OR $2 = ANY(p.compatible_machines)
+         )
+         AND (
+           $3 = ''
+           OR p.category = $3
+         )
+       ORDER BY p.name ASC, p.internal_code ASC
        LIMIT $4`,
       [search, machine, category, limit]
     );
@@ -248,6 +275,7 @@ router.get("/catalog", async (req, res) => {
     return respondError(res, error);
   }
 });
+
 
 // ======================================================
 // UBICACIONES
@@ -425,6 +453,139 @@ router.post("/parts", async (req, res) => {
     return respondError(res, error);
   }
 });
+
+
+
+ // ======================================================
+// ACTUALIZACIÓN DE DATOS DE UN REPUESTO EXISTENTE
+// PUT /api/spare-parts/parts/:id
+// No crea registros ni modifica existencias.
+// ======================================================
+
+router.put("/parts/:id", async (req, res) => {
+  const partId = req.params.id;
+
+  const {
+    internalCode,
+    name,
+    description,
+    category = null,
+    manufacturer = null,
+    manufacturerReference = null,
+    compatibleMachines = [],
+    unitOfMeasure = "unidad",
+  } = req.body ?? {};
+
+  if (!validUuid(partId)) {
+    return res.status(400).json({
+      status: "ERROR",
+      message: "Identificador de repuesto no válido.",
+    });
+  }
+
+  if (
+    !validText(internalCode, 100) ||
+    !validText(name, 200) ||
+    !validText(description, 5000) ||
+    !validText(unitOfMeasure, 30) ||
+    !Array.isArray(compatibleMachines) ||
+    compatibleMachines.length > 100 ||
+    compatibleMachines.some((item) => !validText(item, 100))
+  ) {
+    return res.status(400).json({
+      status: "ERROR",
+      message: "Los datos del repuesto no son válidos.",
+    });
+  }
+
+  for (const value of [category, manufacturer, manufacturerReference]) {
+    if (
+      value !== null &&
+      value !== undefined &&
+      (typeof value !== "string" || value.length > 200)
+    ) {
+      return res.status(400).json({
+        status: "ERROR",
+        message: "Uno de los campos opcionales supera el límite permitido.",
+      });
+    }
+  }
+
+  try {
+    const part = await transaction(async (client) => {
+      await requireInventoryManager(client, req.user.id);
+
+      const currentResult = await client.query(
+        `SELECT *
+         FROM public.spare_parts
+         WHERE id = $1
+           AND is_active = TRUE
+         FOR UPDATE`,
+        [partId]
+      );
+
+      if (!currentResult.rowCount) {
+        fail("El repuesto no existe o está inactivo.", 404);
+      }
+
+      const before = currentResult.rows[0];
+
+      const updatedResult = await client.query(
+        `UPDATE public.spare_parts
+         SET internal_code = $2,
+             name = $3,
+             description = $4,
+             category = $5,
+             manufacturer = $6,
+             manufacturer_reference = $7,
+             compatible_machines = $8::text[],
+             unit_of_measure = $9,
+             updated_by = $10,
+             updated_at = NOW()
+         WHERE id = $1
+           AND is_active = TRUE
+         RETURNING *`,
+        [
+          partId,
+          internalCode.trim(),
+          name.trim(),
+          description.trim(),
+          category?.trim() || null,
+          manufacturer?.trim() || null,
+          manufacturerReference?.trim() || null,
+          compatibleMachines.map((item) => item.trim()),
+          unitOfMeasure.trim(),
+          req.user.id,
+        ]
+      );
+
+      const updated = updatedResult.rows[0];
+
+      await audit(client, {
+        actorUserId: req.user.id,
+        action: "SPARE_PART_UPDATED",
+        entityType: "SPARE_PART",
+        entityId: partId,
+        beforeData: before,
+        afterData: updated,
+        details: {
+          stock_modified: false,
+        },
+      });
+
+      return updated;
+    });
+
+    return res.json({
+      status: "OK",
+      part,
+      message: "Datos del repuesto actualizados correctamente. El stock no fue modificado.",
+    });
+  } catch (error) {
+    return respondError(res, error);
+  }
+});
+
 
 // ======================================================
 // ENTRADA DE STOCK
