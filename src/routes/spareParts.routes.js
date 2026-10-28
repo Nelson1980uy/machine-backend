@@ -277,6 +277,88 @@ router.get("/catalog", async (req, res) => {
 });
 
 
+
+/**
+ * STOCK POR UBICACIÓN
+ * GET /api/spare-parts/stock
+ *
+ * Consulta de solo lectura para usuarios autenticados.
+ * No modifica existencias, reservas ni movimientos.
+ */
+router.get("/stock", async (req, res) => {
+  try {
+    const search =
+      typeof req.query.search === "string"
+        ? req.query.search.trim().slice(0, 100)
+        : "";
+
+    const machine =
+      typeof req.query.machine === "string"
+        ? req.query.machine.trim().slice(0, 100)
+        : "";
+
+    const result = await pool.query(
+      `SELECT
+         s.id AS stock_id,
+         p.id AS part_id,
+         p.internal_code,
+         p.name AS part_name,
+         p.description,
+         p.category,
+         p.manufacturer,
+         p.manufacturer_reference,
+         p.compatible_machines,
+         p.unit_of_measure,
+         l.id AS location_id,
+         l.code AS location_code,
+         l.name AS location_name,
+         s.lot_number,
+         s.serial_number,
+         s.quantity_on_hand,
+         s.quantity_reserved,
+         s.quantity_on_hand - s.quantity_reserved AS quantity_available,
+         s.minimum_stock,
+         CASE
+           WHEN s.quantity_on_hand - s.quantity_reserved <= 0
+             THEN 'OUT_OF_STOCK'
+           WHEN s.quantity_on_hand - s.quantity_reserved <= s.minimum_stock
+             THEN 'LOW_STOCK'
+           ELSE 'IN_STOCK'
+         END AS stock_status
+       FROM public.spare_part_stock s
+       JOIN public.spare_parts p ON p.id = s.part_id
+       JOIN public.spare_part_locations l ON l.id = s.location_id
+       WHERE p.is_active = TRUE
+         AND l.is_active = TRUE
+         AND (
+           $1 = ''
+           OR p.internal_code ILIKE '%' || $1 || '%'
+           OR p.name ILIKE '%' || $1 || '%'
+           OR COALESCE(p.description, '') ILIKE '%' || $1 || '%'
+           OR COALESCE(p.manufacturer, '') ILIKE '%' || $1 || '%'
+           OR COALESCE(p.manufacturer_reference, '') ILIKE '%' || $1 || '%'
+         )
+         AND (
+           $2 = ''
+           OR $2 = ANY(p.compatible_machines)
+         )
+       ORDER BY p.name ASC, l.name ASC
+       LIMIT 500`,
+      [search, machine]
+    );
+
+    return res.json({
+      status: "OK",
+      total: result.rowCount,
+      stock: result.rows,
+    });
+  } catch (error) {
+    return respondError(res, error);
+  }
+});
+
+
+
 // ======================================================
 // UBICACIONES
 // GET /api/spare-parts/locations
