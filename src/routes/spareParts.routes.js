@@ -1483,6 +1483,177 @@ router.get("/movements", async (req, res) => {
 // ======================================================
 // AUDITORÍA: solo administrador.
 // GET /api/spare-parts/audit
+router.get("/movements/:movementId", async (req, res) => {
+  try {
+    const { movementId } = req.params;
+
+    // 1. Validar el identificador.
+    if (!validUuid(movementId)) {
+      return res.status(400).json({
+        status: "ERROR",
+        message: "El identificador del movimiento no es válido.",
+      });
+    }
+
+    // 2. Verificar permisos del usuario.
+    await requireInventoryManager(pool, req.user.id);
+
+    // 3. Consultar el movimiento y sus datos relacionados.
+    const result = await pool.query(
+      `
+      SELECT
+        m.*,
+
+        -- REPUESTO
+        p.id AS part_id,
+        p.created_at AS part_created_at,
+        p.internal_code,
+        p.name AS part_name,
+        p.description AS part_description,
+        p.category AS part_category,
+        p.manufacturer AS part_manufacturer,
+        p.manufacturer_reference AS part_manufacturer_reference,
+        p.compatible_machines,
+        p.unit_of_measure,
+
+        -- CREADOR ORIGINAL DE LA FICHA
+        p.created_by AS creator_user_id,
+        p.creator_employee_id,
+        p.creator_first_name,
+        p.creator_last_name,
+        p.creator_job_title,
+        p.creator_sector,
+        p.creator_production_line,
+        p.creator_assigned_machine,
+        p.creator_specialty,
+        p.creator_shift,
+        p.creator_plant,
+        p.creator_plant_number,
+        p.creator_photo_url,
+
+        -- UBICACIÓN Y EXISTENCIAS ACTUALES
+        l.code AS location_code,
+        l.name AS location_name,
+        s.lot_number,
+        s.serial_number,
+        s.minimum_stock,
+
+        s.quantity_on_hand AS current_quantity_on_hand,
+        s.quantity_reserved AS current_quantity_reserved,
+
+        (
+          s.quantity_on_hand - s.quantity_reserved
+        ) AS current_quantity_available,
+
+        -- RESPONSABLE DEL MOVIMIENTO
+        u.employee_id AS actor_employee_id,
+        u.email AS actor_email,
+
+        NULLIF(
+          TRIM(
+            CONCAT_WS(
+              ' ',
+              up.first_name,
+              up.last_name
+            )
+          ),
+          ''
+        ) AS actor_name,
+
+        COALESCE(
+          NULLIF(TRIM(up.photo_url), ''),
+          '/operador.png'
+        ) AS actor_photo,
+
+        up.job_title AS actor_job_title,
+        up.sector AS actor_sector,
+        up.production_line AS actor_production_line,
+        up.assigned_machine AS actor_assigned_machine,
+        up.specialty AS actor_specialty,
+        up.shift AS actor_shift,
+        up.plant AS actor_plant,
+        up.plant_number AS actor_plant_number,
+
+        -- CANTIDADES ORIGINALES DE RECEPCIÓN
+        CASE
+          WHEN m.movement_type = 'RECEIPT'
+          THEN m.quantity_delta
+          ELSE NULL
+        END AS original_quantity_received,
+
+        CASE
+          WHEN m.movement_type = 'RECEIPT'
+          THEN m.quantity_after
+          ELSE NULL
+        END AS quantity_after_receipt,
+
+        -- IMÁGENES DEL REPUESTO
+        COALESCE(
+          (
+            SELECT json_agg(
+              json_build_object(
+                'id', img.id,
+                'url', img.public_url,
+                'fileName', img.file_name,
+                'mimeType', img.mime_type
+              )
+              ORDER BY img.created_at
+            )
+            FROM public.spare_part_images img
+            WHERE img.part_id = p.id
+          ),
+          '[]'::json
+        ) AS images
+
+      FROM public.spare_part_movements m
+
+      INNER JOIN public.spare_part_stock s
+        ON s.id = m.stock_id
+
+      INNER JOIN public.spare_parts p
+        ON p.id = s.part_id
+
+      INNER JOIN public.spare_part_locations l
+        ON l.id = s.location_id
+
+      LEFT JOIN public.users u
+        ON u.id = m.actor_user_id
+
+      LEFT JOIN public.user_profiles up
+        ON up.user_id = u.id
+
+      WHERE m.id = $1
+      LIMIT 1
+      `,
+      [movementId]
+    );
+
+    // 4. Comprobar si existe el movimiento.
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        status: "ERROR",
+        message: "No se encontró el movimiento solicitado.",
+      });
+    }
+
+    // 5. Devolver el resultado.
+    return res.status(200).json({
+      status: "OK",
+      movement: result.rows[0],
+    });
+  } catch (error) {
+    console.error("[SPARE PARTS MOVEMENT DETAIL]", error);
+
+    return respondError(res, error);
+  }
+});
+
+
+// ======================================================
+// AUDITORÍA: solo administrador.
+// GET /api/spare-parts/audit
+// ======================================================
+
 // ======================================================
 
 router.get("/audit", async (req, res) => {
