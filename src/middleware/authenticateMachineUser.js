@@ -104,3 +104,102 @@ export default async function authenticateMachineUser(
     });
   }
 }
+
+// =========================================================
+// AUTENTICACIÓN SOCKET.IO
+// =========================================================
+
+export async function authenticateMachineSocket(
+  socket,
+  next
+) {
+  const token = socket.handshake.auth?.token;
+
+  if (
+    typeof token !== "string" ||
+    !token.trim()
+  ) {
+    return next(
+      new Error("Sesión no autorizada.")
+    );
+  }
+
+  let decoded;
+
+  try {
+    decoded = jwt.verify(
+      token.trim(),
+      JWT_SECRET
+    );
+  } catch {
+    return next(
+      new Error(
+        "La sesión ha expirado o no es válida."
+      )
+    );
+  }
+
+  if (!decoded?.userId) {
+    return next(
+      new Error("Sesión no válida.")
+    );
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        email,
+        employee_id,
+        role,
+        status
+      FROM public.users
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [decoded.userId]
+    );
+
+    if (result.rows.length === 0) {
+      return next(
+        new Error("El operador ya no existe.")
+      );
+    }
+
+    const user = result.rows[0];
+
+    if (user.status !== "active") {
+      return next(
+        new Error(
+          "La cuenta del operador no está activa."
+        )
+      );
+    }
+
+    socket.data.authenticatedUser = {
+      id: user.id,
+      email: user.email,
+      employeeId: user.employee_id,
+      role: user.role,
+      status: user.status,
+    };
+
+    // La identidad procede exclusivamente del JWT.
+    socket.data.userId = user.id;
+
+    return next();
+
+  } catch (error) {
+    console.error(
+      "MACHINE SOCKET AUTHENTICATION ERROR:",
+      error.message
+    );
+
+    return next(
+      new Error(
+        "No se pudo validar la sesión."
+      )
+    );
+  }
+}

@@ -110,20 +110,21 @@ function registerChatSocket(io, socket) {
   // REGISTRAR USUARIO
   // =======================================================
 
-  socket.on("chat:register", async (data = {}) => {
-    try {
-      const userId =
-        typeof data.userId === "string"
-          ? data.userId.trim()
-          : "";
+ socket.on("chat:register", async () => {
+  try {
+    // La identidad procede exclusivamente del JWT verificado.
+    const userId =
+      typeof socket.data.userId === "string"
+        ? socket.data.userId.trim()
+        : "";
 
-      if (!userId) {
-        socket.emit("chat:register:error", {
-          message: "No se recibió un ID de usuario válido.",
-        });
+    if (!userId) {
+      socket.emit("chat:register:error", {
+        message: "La sesión no está autenticada.",
+      });
 
-        return;
-      }
+      return;
+    }
 
       // Si el socket cambia de usuario, quitarlo de la sesión anterior.
       const previousUserId = socket.data.userId;

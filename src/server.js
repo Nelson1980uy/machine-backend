@@ -21,6 +21,7 @@ import operatorNearbyRoutes from "./routes/operatorNearby.routes.js";
 import sparePartsGovernanceRoutes from "./routes/sparePartsGovernance.routes.js";
 import sparePartsRoutes from "./routes/spareParts.routes.js";
 import { registerChatSocket } from "./socket/chat.socket.js";
+import { authenticateMachineSocket } from "./middleware/authenticateMachineUser.js";
 import mailRoutes from "./routes/mail.routes.js";
 
 // =========================================================
@@ -59,6 +60,12 @@ const io = new Server(httpServer, {
     credentials: true,
   },
 });
+
+// =========================================================
+// AUTENTICACIÓN JWT DE SOCKET.IO
+// =========================================================
+
+io.use(authenticateMachineSocket);
 
 // =========================================================
 // MIDDLEWARE CORS
