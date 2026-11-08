@@ -21,7 +21,10 @@ import operatorNearbyRoutes from "./routes/operatorNearby.routes.js";
 import sparePartsGovernanceRoutes from "./routes/sparePartsGovernance.routes.js";
 import sparePartsRoutes from "./routes/spareParts.routes.js";
 import { registerChatSocket } from "./socket/chat.socket.js";
-import { authenticateMachineSocket } from "./middleware/authenticateMachineUser.js";
+import authenticateMachineUser, {
+  authenticateMachineSocket,
+} from "./middleware/authenticateMachineUser.js";
+import globalChannelRoutes from "./routes/globalChannel.routes.js";
 import mailRoutes from "./routes/mail.routes.js";
 
 // =========================================================
@@ -116,6 +119,12 @@ app.use(
 );
 
 app.use("/api/auth", authRoutes);
+
+app.use(
+  "/api/chat/global",
+  authenticateMachineUser,
+  globalChannelRoutes
+);
 
 app.use("/api/chat", chatRoutes);
 

@@ -508,6 +508,24 @@ function getConnectedUsers() {
   return Array.from(connectedUsers.values());
 }
 
+// =========================================================
+// EMITIR EVENTOS DEL CANAL GLOBAL
+// Reutiliza la instancia principal de Socket.IO.
+// =========================================================
+
+function emitGlobalChannelEvent(event, payload) {
+  if (!activeIo) {
+    console.warn(
+      "GLOBAL CHANNEL: Socket.IO todavía no está disponible."
+    );
+
+    return false;
+  }
+
+  activeIo.emit(event, payload);
+  return true;
+}
+
 
 // =========================================================
 // OBTENER SOCKET PRINCIPAL DE UN USUARIO
@@ -569,4 +587,5 @@ export {
   getConnectedUsers,
   getUserSocketId,
   emitProfileAccessRequest,
+  emitGlobalChannelEvent,
 };
