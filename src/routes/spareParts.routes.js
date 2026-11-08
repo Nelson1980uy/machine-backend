@@ -1480,9 +1480,10 @@ router.get("/movements", async (req, res) => {
   }
 });
 
+
 // ======================================================
-// AUDITORÍA: solo administrador.
-// GET /api/spare-parts/audit
+// DETALLE DEL MOVIMIENTO DE INVENTARIO
+// GET /api/spare-parts/movements/:movementId
 router.get("/movements/:movementId", async (req, res) => {
   try {
     const { movementId } = req.params;
@@ -1504,7 +1505,9 @@ router.get("/movements/:movementId", async (req, res) => {
       SELECT
         m.*,
 
+        -- ==============================================
         -- REPUESTO
+        -- ==============================================
         p.id AS part_id,
         p.created_at AS part_created_at,
         p.internal_code,
@@ -1516,22 +1519,58 @@ router.get("/movements/:movementId", async (req, res) => {
         p.compatible_machines,
         p.unit_of_measure,
 
+        -- ==============================================
         -- CREADOR ORIGINAL DE LA FICHA
+        -- ==============================================
         p.created_by AS creator_user_id,
-        p.creator_employee_id,
-        p.creator_first_name,
-        p.creator_last_name,
-        p.creator_job_title,
-        p.creator_sector,
-        p.creator_production_line,
-        p.creator_assigned_machine,
-        p.creator_specialty,
-        p.creator_shift,
-        p.creator_plant,
-        p.creator_plant_number,
-        p.creator_photo_url,
 
+        COALESCE(
+          NULLIF(TRIM(p.creator_employee_id), ''),
+          creator.employee_id
+        ) AS creator_employee_id,
+
+        NULLIF(TRIM(creator_profile.first_name), '')
+          AS creator_first_name,
+
+        NULLIF(TRIM(creator_profile.last_name), '')
+          AS creator_last_name,
+
+        NULLIF(
+          TRIM(
+            CONCAT_WS(
+              ' ',
+              NULLIF(TRIM(creator_profile.first_name), ''),
+              NULLIF(TRIM(creator_profile.last_name), '')
+            )
+          ),
+          ''
+        ) AS creator_name,
+
+        creator.email AS creator_email,
+
+        NULLIF(TRIM(creator_profile.photo_url), '')
+          AS creator_photo_url,
+
+        creator_profile.job_title AS creator_job_title,
+        creator_profile.sector AS creator_sector,
+        creator_profile.production_line AS creator_production_line,
+        creator_profile.assigned_machine AS creator_assigned_machine,
+        creator_profile.specialty AS creator_specialty,
+        creator_profile.shift AS creator_shift,
+        creator_profile.plant AS creator_plant,
+        creator_profile.plant_number AS creator_plant_number,
+
+        -- ==============================================
+        -- IDENTIFICACIÓN DEL RESPONSABLE
+        -- ==============================================
+        (
+          m.actor_user_id IS NOT NULL
+          AND m.actor_user_id = p.created_by
+        ) AS same_person,
+
+        -- ==============================================
         -- UBICACIÓN Y EXISTENCIAS ACTUALES
+        -- ==============================================
         l.code AS location_code,
         l.name AS location_name,
         s.lot_number,
@@ -1545,39 +1584,85 @@ router.get("/movements/:movementId", async (req, res) => {
           s.quantity_on_hand - s.quantity_reserved
         ) AS current_quantity_available,
 
+        -- ==============================================
         -- RESPONSABLE DEL MOVIMIENTO
+        -- Se evita duplicar los datos del creador.
+        -- ==============================================
         u.employee_id AS actor_employee_id,
-        u.email AS actor_email,
 
-        NULLIF(
-          TRIM(
-            CONCAT_WS(
-              ' ',
-              up.first_name,
-              up.last_name
-            )
-          ),
-          ''
-        ) AS actor_name,
+        CASE
+          WHEN m.actor_user_id = p.created_by THEN NULL
+          ELSE u.email
+        END AS actor_email,
 
-        COALESCE(
-          NULLIF(TRIM(up.photo_url), ''),
-          '/operador.png'
-        ) AS actor_photo,
+        CASE
+          WHEN m.actor_user_id = p.created_by THEN NULL
+          ELSE NULLIF(
+            TRIM(
+              CONCAT_WS(
+                ' ',
+                NULLIF(TRIM(up.first_name), ''),
+                NULLIF(TRIM(up.last_name), '')
+              )
+            ),
+            ''
+          )
+        END AS actor_name,
 
-        up.job_title AS actor_job_title,
-        up.sector AS actor_sector,
-        up.production_line AS actor_production_line,
-        up.assigned_machine AS actor_assigned_machine,
-        up.specialty AS actor_specialty,
-        up.shift AS actor_shift,
-        up.plant AS actor_plant,
-        up.plant_number AS actor_plant_number,
+        CASE
+          WHEN m.actor_user_id = p.created_by THEN NULL
+          ELSE COALESCE(
+            NULLIF(TRIM(up.photo_url), ''),
+            '/operador.png'
+          )
+        END AS actor_photo,
 
+        CASE
+          WHEN m.actor_user_id = p.created_by THEN NULL
+          ELSE up.job_title
+        END AS actor_job_title,
+
+        CASE
+          WHEN m.actor_user_id = p.created_by THEN NULL
+          ELSE up.sector
+        END AS actor_sector,
+
+        CASE
+          WHEN m.actor_user_id = p.created_by THEN NULL
+          ELSE up.production_line
+        END AS actor_production_line,
+
+        CASE
+          WHEN m.actor_user_id = p.created_by THEN NULL
+          ELSE up.assigned_machine
+        END AS actor_assigned_machine,
+
+        CASE
+          WHEN m.actor_user_id = p.created_by THEN NULL
+          ELSE up.specialty
+        END AS actor_specialty,
+
+        CASE
+          WHEN m.actor_user_id = p.created_by THEN NULL
+          ELSE up.shift
+        END AS actor_shift,
+
+        CASE
+          WHEN m.actor_user_id = p.created_by THEN NULL
+          ELSE up.plant
+        END AS actor_plant,
+
+        CASE
+          WHEN m.actor_user_id = p.created_by THEN NULL
+          ELSE up.plant_number
+        END AS actor_plant_number,
+
+        -- ==============================================
         -- CANTIDADES ORIGINALES DE RECEPCIÓN
+        -- ==============================================
         CASE
           WHEN m.movement_type = 'RECEIPT'
-          THEN m.quantity_delta
+          THEN ABS(m.quantity_delta)
           ELSE NULL
         END AS original_quantity_received,
 
@@ -1587,7 +1672,9 @@ router.get("/movements/:movementId", async (req, res) => {
           ELSE NULL
         END AS quantity_after_receipt,
 
+        -- ==============================================
         -- IMÁGENES DEL REPUESTO
+        -- ==============================================
         COALESCE(
           (
             SELECT json_agg(
@@ -1599,28 +1686,36 @@ router.get("/movements/:movementId", async (req, res) => {
               )
               ORDER BY img.created_at
             )
-            FROM public.spare_part_images img
+            FROM public.spare_part_images AS img
             WHERE img.part_id = p.id
           ),
           '[]'::json
         ) AS images
 
-      FROM public.spare_part_movements m
+      FROM public.spare_part_movements AS m
 
-      INNER JOIN public.spare_part_stock s
+      INNER JOIN public.spare_part_stock AS s
         ON s.id = m.stock_id
 
-      INNER JOIN public.spare_parts p
+      INNER JOIN public.spare_parts AS p
         ON p.id = s.part_id
 
-      INNER JOIN public.spare_part_locations l
+      INNER JOIN public.spare_part_locations AS l
         ON l.id = s.location_id
 
-      LEFT JOIN public.users u
+      -- Responsable que realizó el movimiento.
+      LEFT JOIN public.users AS u
         ON u.id = m.actor_user_id
 
-      LEFT JOIN public.user_profiles up
+      LEFT JOIN public.user_profiles AS up
         ON up.user_id = u.id
+
+      -- Usuario que creó originalmente la ficha.
+      LEFT JOIN public.users AS creator
+        ON creator.id = p.created_by
+
+      LEFT JOIN public.user_profiles AS creator_profile
+        ON creator_profile.user_id = p.created_by
 
       WHERE m.id = $1
       LIMIT 1
